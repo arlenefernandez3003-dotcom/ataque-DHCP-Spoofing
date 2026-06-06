@@ -7,9 +7,6 @@
 
 ---
 
-## ⚠️ Aviso Legal
-
-Este repositorio es **exclusivamente educativo**. Todo el contenido está diseñado para entornos de laboratorio controlados y autorizados. Su uso fuera de un entorno autorizado viola la **Ley 53-07 sobre Crímenes y Delitos de Alta Tecnología (República Dominicana)** y legislaciones internacionales equivalentes.
 
 ---
 
@@ -201,7 +198,7 @@ ataque3-dhcp-spoofing/
 
 | Campo | Detalle |
 |---|---|
-| **Nombre** | [Tu nombre] |
+| **Nombre** | Arlene Fernandez|
 | **Matrícula** | 20250730 |
 | **Institución** | ITLA – Instituto Tecnológico de las Américas |
 | **Carrera** | Seguridad de la Información |
